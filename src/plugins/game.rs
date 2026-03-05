@@ -10,13 +10,20 @@ use crate::{
     prelude::{note::*, sound::SoundResources, visual::NoteAssets, *},
     resources::chart::ChartPlayback,
 };
-use bevy::{app::App, prelude::*};
+use bevy::{
+    app::App, color::palettes::css::LIGHT_CYAN, post_process::dof::calculate_focal_length,
+    prelude::*,
+};
 use bevy_kira_audio::prelude::*;
+use bevy_prototype_lyon::prelude::*;
 use std::f32::consts::{FRAC_PI_2, PI, SQRT_2};
 use std::path::Path;
 use std::time::Duration;
 
 pub(crate) fn plugin(app: &mut App) {
+    if !app.is_plugin_added::<ShapePlugin>() {
+        app.add_plugins(ShapePlugin);
+    }
     // Your game logic here
     app.init_resource::<ChartPlayback>()
         .init_resource::<SoundResources>()
@@ -45,8 +52,17 @@ fn resource_setup(
 
     let tap_mesh = meshes.add(Annulus::new(radius, radius * 0.75).mesh().resolution(256));
     let hold_mesh = meshes.add(create_hollow_arch(radius));
-
     let touch_circle_mesh = meshes.add(Circle::new(radius * 0.1));
+    let width = 8.0;
+    let height = 20.0;
+    let chevron_shape = ShapePath::new()
+        .move_to(Vec2::new(-width, height))
+        .line_to(Vec2::new(0.0, 0.0))
+        .line_to(Vec2::new(-width, -height))
+        .line_to(Vec2::new(0.0, -height))
+        .line_to(Vec2::new(width, 0.0))
+        .line_to(Vec2::new(0.0, height))
+        .close();
     // 1. Define your base width and your desired border thickness
     let w = radius * std::f32::consts::SQRT_2 / 2.0;
     let t = radius * 0.15; // Change 0.1 to make the border thicker or thinner!
@@ -75,6 +91,7 @@ fn resource_setup(
         slide_mesh,
         touch_circle_mesh,
         touch_triangle_mesh,
+        chevron_shape,
         tap_material,
         hold_material,
         slide_material,
@@ -178,7 +195,7 @@ pub fn next_bar_process(
                     let button_id = match note.note_type {
                         NoteDetail::Tap(id)
                         | NoteDetail::TapHold(id, _)
-                        | NoteDetail::SlideStar(id) => id,
+                        | NoteDetail::Slide(id, _, _) => id,
                         _ => 0, // Fallback for Touches which might use a different coordinate system
                     };
 
@@ -218,7 +235,7 @@ pub fn next_bar_process(
                         NoteDetail::TapHold(id, (divider, length)) => {
                             NoteType::TapHold(id, (divider, length))
                         }
-                        NoteDetail::SlideStar(id) => NoteType::SlideStar(id),
+                        NoteDetail::Slide(id, _, duration) => NoteType::Slide(id, duration),
                         NoteDetail::Touch((id, c)) => NoteType::Touch((id, c)),
                         NoteDetail::TouchHold((id, c), (divider, length)) => {
                             NoteType::TouchHold((id, c), (divider, length))
@@ -293,7 +310,10 @@ pub fn next_bar_process(
                                 ));
                             });
                         }
-                        NoteDetail::SlideStar(_) => {
+                        NoteDetail::Slide(btn, shape, duration) => {
+                            let points = generate_points(&shape, judgment_radius);
+                            println!("Points of on slide: {:?}", points);
+                            let total_length = calculate_total_length(&points);
                             entity_cmds.insert((
                                 Mesh2d(note_assets.slide_mesh.clone()),
                                 MeshMaterial2d(if is_paired {
@@ -302,6 +322,12 @@ pub fn next_bar_process(
                                     note_assets.slide_material.clone()
                                 }),
                                 button_note_transform,
+                                Visibility::default(), // <-- ADD THIS SO THE QUERY CAN FIND IT!
+                                SlidePath {
+                                    waypoints: points,
+                                    total_length: total_length,
+                                    track_entity: None,
+                                },
                             ));
                         }
                         NoteDetail::Touch(_) => {
@@ -372,6 +398,7 @@ fn update_note(
         &mut Transform,
         Option<&Children>,
         &mut Visibility, //
+        Option<&mut SlidePath>,
     )>,
     mut child_hold_query: Query<
         (&mut Transform, &HoldNoteElement),
@@ -381,12 +408,16 @@ fn update_note(
         (&mut Transform, &TouchElement),
         (Without<NoteTiming>, Without<HoldNoteElement>),
     >,
+    // 2. Added these three queries to manage the track!
+    mut arrow_query: Query<(Entity, &SlideArrow, &mut Visibility, &mut Shape), Without<NoteTiming>>,
+    children_query: Query<&Children>,
     mut chart: ResMut<ChartPlayback>,
     time: Res<Time>, // I renamed 'timer' to 'time' to avoid confusion with the Timer component
     mut commands: Commands,
     sound_resources: Res<SoundResources>,
     audio: Res<Audio>,
     mut window: Single<&Window>,
+    mut note_assets: Res<NoteAssets>,
 ) {
     if !chart.is_playing {
         return; // Early return keeps the rest of the code clean
@@ -396,7 +427,8 @@ fn update_note(
     let judgment_radius = size.min_element() / 2.0 - 40.0;
     let spawn_radius = size.min_element() * 0.12;
 
-    for (entity, mut timing, note_type, mut transform, children, mut visibility) in query.iter_mut()
+    for (entity, mut timing, note_type, mut transform, children, mut visibility, mut slide_path) in
+        query.iter_mut()
     {
         // We will store the next state here if a timer finishes
         let mut transition_to = None;
@@ -417,7 +449,35 @@ fn update_note(
                 if grow_timer.just_finished() {
                     // 3. Unhide the Touch note right before it starts moving
                     *visibility = Visibility::Visible;
+                    // --- NEW: SPAWN THE INVISIBLE TRACK ---
+                    if let Some(ref mut path_data) = slide_path {
+                        let track_ent = commands
+                            .spawn((Transform::default(), Visibility::default()))
+                            .with_children(|parent| {
+                                let mut current_dist = 0.0;
+                                while current_dist <= path_data.total_length {
+                                    let (pos, angle) = get_transform_at_distance(
+                                        &path_data.waypoints,
+                                        current_dist,
+                                    );
+                                    parent.spawn((
+                                        ShapeBuilder::with(&note_assets.chevron_shape)
+                                            .stroke((LIGHT_CYAN.with_alpha(0.0), 10.0))
+                                            .build(),
+                                        Transform::from_translation(pos.extend(0.5))
+                                            .with_rotation(Quat::from_rotation_z(angle)),
+                                        SlideArrow {
+                                            distance_along_path: current_dist,
+                                        },
+                                        Visibility::Visible, // Starts completely hidden!
+                                    ));
+                                    current_dist += 35.0; // Spacing
+                                }
+                            })
+                            .id();
 
+                        path_data.track_entity = Some(track_ent);
+                    }
                     // ALL notes (including Touch) now transition to Moving
                     transition_to = Some(NoteTiming::Moving(Timer::from_seconds(
                         2.0 / (chart.chart_speed * chart.note_speed),
@@ -485,6 +545,19 @@ fn update_note(
                             }
                         }
                     }
+                    if let Some(ref path_data) = slide_path {
+                        if let Some(track_ent) = path_data.track_entity {
+                            if let Ok(track_children) = children_query.get(track_ent) {
+                                for child in track_children.iter() {
+                                    if let Ok((_, _, _, mut shape)) = arrow_query.get_mut(child) {
+                                        if let Some(stroke) = &mut shape.stroke {
+                                            stroke.color = LIGHT_CYAN.with_alpha(progress).into();
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
                 }
 
                 // --- 2. DESPAWN LOGIC ---
@@ -505,6 +578,20 @@ fn update_note(
                             ));
                         }
                         // Add TouchHold transition here later when you are ready!
+                        NoteType::Slide(_, duration) => {
+                            commands
+                                .entity(entity)
+                                .insert(Mesh2d(note_assets.slide_mesh.clone()));
+                            commands
+                                .entity(entity)
+                                .insert(MeshMaterial2d(note_assets.slide_material.clone()));
+                            // Wait 1 Beat before sliding
+                            let one_beat_duration = 60.0 / chart.bpm;
+                            transition_to = Some(NoteTiming::Waiting(Timer::from_seconds(
+                                one_beat_duration,
+                                TimerMode::Once,
+                            )));
+                        }
                         _ => {
                             commands.entity(entity).despawn();
                         }
@@ -548,6 +635,53 @@ fn update_note(
                 if hold_timer.just_finished() {
                     audio.play(sound_resources.hit.clone());
                     commands.entity(entity).despawn();
+                }
+            }
+            // --- THE NEW SLIDE PHASES ---
+            NoteTiming::Waiting(wait_timer) => {
+                wait_timer.tick(time.delta());
+                if wait_timer.just_finished() {
+                    if let NoteType::Slide(_, (divider, length)) = note_type {
+                        let slide_duration =
+                            (*length as f32 / *divider as f32) * (240.0 / chart.bpm);
+                        transition_to = Some(NoteTiming::Sliding(Timer::from_seconds(
+                            slide_duration,
+                            TimerMode::Once,
+                        )));
+                    }
+                }
+            }
+            NoteTiming::Sliding(slide_timer) => {
+                slide_timer.tick(time.delta());
+                let progress = slide_timer.fraction();
+
+                if let Some(ref path_data) = slide_path {
+                    // 1. Move the Star
+                    let current_distance = progress * path_data.total_length;
+                    let (new_pos, _) =
+                        get_transform_at_distance(&path_data.waypoints, current_distance);
+                    transform.translation = new_pos.extend(transform.translation.z);
+
+                    // 2. Eat the Track
+                    if let Some(track_ent) = path_data.track_entity {
+                        if let Ok(track_children) = children_query.get(track_ent) {
+                            for child in track_children.iter() {
+                                if let Ok((arrow_ent, arrow, _, _)) = arrow_query.get_mut(child) {
+                                    if arrow.distance_along_path <= current_distance {
+                                        commands.entity(arrow_ent).despawn();
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    // 3. Clean up
+                    if slide_timer.just_finished() {
+                        commands.entity(entity).despawn();
+                        if let Some(track_ent) = path_data.track_entity {
+                            commands.entity(track_ent).despawn();
+                        }
+                    }
                 }
             }
         }

@@ -1,8 +1,8 @@
 use bevy::prelude::*;
 
-use starter::AppPlugin;
-
+use simai_player::AppPlugin;
 fn main() {
-    
-    App::new().add_plugins(AppPlugin).run();
+    App::new()
+        .add_plugins(AppPlugin)
+        .run();
 }
