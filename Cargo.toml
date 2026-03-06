@@ -7,8 +7,8 @@ publish = false
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
-bevy = "0.18"
-bevy_kira_audio = { version = "0.25", features = ["wav", "ogg"] } # Use the version compatible with your Bevy version
+bevy = { version = "0.18", features = ["wav", "mp3"] }
+bevy_kira_audio = { version = "0.25", features = ["wav"] } # Use the version compatible with your Bevy version
 bevy_enhanced_input = "0.22"
 
 rand = "0.9"
@@ -17,6 +17,7 @@ log = { version = "*", features = ["max_level_debug", "release_max_level_error"]
 tracing = { version = "0.1", features = ["max_level_debug", "release_max_level_warn"] }
 regex = "1.12.3"
 bevy_prototype_lyon = "0.16.0"
+clap = { version = "4.5.60", features = ["derive"] }
 
 [features]
 default = [
@@ -62,7 +63,7 @@ opt-level = 3
 # Optimize for size in the wasm-release profile to reduce load times and bandwidth usage on web.
 [profile.release]
 # Compile the entire crate as one unit.
-# Slows compile times, marginal improvements.
+# Slows compile times, marbevy = { version = "...", features = ["mp3", "wav"] }ginal improvements.
 codegen-units = 1
 # Do a second optimization pass over the entire program, including dependencies.
 # Slows compile times, marginal improvements.

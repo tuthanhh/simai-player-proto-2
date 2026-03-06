@@ -14,11 +14,13 @@ use bevy::{
     app::App, color::palettes::css::LIGHT_CYAN, post_process::dof::calculate_focal_length,
     prelude::*,
 };
+use std::fs; 
 use bevy_kira_audio::prelude::*;
 use bevy_prototype_lyon::prelude::*;
 use std::f32::consts::{FRAC_PI_2, PI, SQRT_2};
 use std::path::Path;
 use std::time::Duration;
+use bevy::audio::AudioSource;
 
 pub(crate) fn plugin(app: &mut App) {
     if !app.is_plugin_added::<ShapePlugin>() {
@@ -27,12 +29,13 @@ pub(crate) fn plugin(app: &mut App) {
     // Your game logic here
     app.init_resource::<ChartPlayback>()
         .init_resource::<SoundResources>()
-        .add_systems(Startup, (spawn_judgement_ring, chart_setup, resource_setup))
+        .add_systems(Startup, (spawn_judgement_ring, chart_setup, resource_setup, play_song).chain())
         .add_systems(Update, (next_bar_process, update_note));
 }
 fn resource_setup(
     mut sound_resources: ResMut<SoundResources>,
     asset_server: Res<AssetServer>,
+    chart_config: Res<ChartConfig>,
     mut commands: Commands,
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<ColorMaterial>>,
@@ -44,7 +47,19 @@ fn resource_setup(
 
     // Initialize your sound resources here
     sound_resources.hit = asset_server.load("audio/SE_GAME_ANSWER_.wav");
-    // 1. Define materials
+    // You can pass the PathBuf directly by reference!
+    let song_path_owned = chart_config.song_path.to_string_lossy().replace('\\', "/");
+    // 1. Read the bytes directly from the OS
+    if let Ok(bytes) = fs::read(&chart_config.song_path) {
+        // 2. Create the Bevy asset manually
+        let audio_source = AudioSource { bytes: bytes.into() };
+        
+        // 3. Add it to the Assets<AudioSource> resource
+        // (You'd need mut audio_assets: ResMut<Assets<AudioSource>> in your system)
+        let handle = asset_server.add(audio_source); 
+        sound_resources.song = handle;    // 1. Define materials
+    } 
+    
     let tap_material = materials.add(ColorMaterial::from(Color::srgb(1.0, 0.4, 0.6))); // Pink
     let hold_material = materials.add(ColorMaterial::from(Color::srgb(1.0, 0.4, 0.6))); // Cyan
     let slide_material = materials.add(ColorMaterial::from(Color::srgb(0.4, 0.8, 1.0))); // Purple
@@ -98,6 +113,11 @@ fn resource_setup(
         paired_material,
     });
 }
+fn play_song(sound_resources: Res<SoundResources>, mut commands: Commands, config: Res<ChartConfig>) {
+	
+    commands.spawn(AudioPlayer::new(sound_resources.song.clone()));
+}
+
 fn spawn_judgement_ring(
     mut commands: Commands,
     mut meshes: ResMut<Assets<Mesh>>,
@@ -140,9 +160,8 @@ fn spawn_judgement_ring(
     }
 }
 
-fn chart_setup(mut chart: ResMut<ChartPlayback>) {
-    chart.events = parser::parse_chart(Path::new("songs/M@GICAL☆CURE! LOVE ♥ SHOT!/maidata.txt"))
-        .expect("Failed to parse chart");
+fn chart_setup(mut chart: ResMut<ChartPlayback>, res: Res<ChartConfig>) {
+    chart.events = parser::parse_chart(&res.chart_path).expect("Failed to parse chart");
     // or
     // chart.events = vec![ChartEvent::NoteGroup(vec![Note {
     //     is_break: false,

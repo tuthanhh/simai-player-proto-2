@@ -9,12 +9,13 @@ mod resources;
 mod styles;
 mod third_party;
 mod utils;
+pub mod cli;
 
 /// Use this module instead of importing the `components`, `plugins`, `resources`, and `utils`
 /// modules directly.
 mod prelude {
     pub use super::*;
-    pub use {components::*, plugins::*, resources::*, styles::*, utils::*};
+    pub use {cli::*, components::*, plugins::*, resources::*, styles::*, utils::*};
 }
 use bevy_kira_audio::prelude::*;
 

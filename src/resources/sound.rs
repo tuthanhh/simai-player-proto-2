@@ -4,4 +4,5 @@ use bevy_kira_audio::AudioSource as KiraAudioSource;
 pub struct SoundResources {
     // Define your sound resources here
     pub hit: Handle<KiraAudioSource>,
+    pub song: Handle<AudioSource>,
 }
