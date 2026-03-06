@@ -311,7 +311,7 @@ pub fn next_bar_process(
                             });
                         }
                         NoteDetail::Slide(btn, shape, duration) => {
-                            let points = generate_points(&shape, judgment_radius);
+                            let points = generate_points(&shape, judgment_radius, spawn_radius);
                             println!("Points of on slide: {:?}", points);
                             let total_length = calculate_total_length(&points);
                             entity_cmds.insert((

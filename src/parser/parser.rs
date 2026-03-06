@@ -188,6 +188,7 @@ fn parse_slide_note(note_str: &str) -> Result<Vec<Note>, String> {
             ^([1-8])                                 # Start button (must be digit for slides)
             ([xfb]*)                                 # Modifiers before slide
             ((?:pp|qq|[-^v<>pqszVw])\d+              # Slide pattern + target
+             (?:(?:pp|qq|[-^v<>pqszVw])\d+)*         # Optional additional shape+target (like p4>6)
              (?:-\d+)*                               # Optional chained targets (like 8-4-7)
              (?:[xfb]*)                              # Optional modifiers after target
              (?:\[[\d:]+\])?                         # Optional duration
@@ -215,7 +216,12 @@ fn parse_slide_note(note_str: &str) -> Result<Vec<Note>, String> {
     let is_break = modifiers_before.contains('x') || modifiers_after.contains('x');
     let is_firework = modifiers_before.contains('f') || modifiers_after.contains('f');
     
-    // Parse the slide pattern(s)
+    // Check if this is a star-chained slide (multiple sequential slides)
+    if slide_pattern_str.contains('*') {
+        return parse_star_chained_slides(start_btn, slide_pattern_str, is_break, is_firework);
+    }
+    
+    // Parse single slide pattern
     let slide_shape = parse_slide_pattern(start_btn, slide_pattern_str)?;
     
     Ok(vec![Note {
@@ -229,6 +235,7 @@ fn parse_slide_pattern(start_btn: usize, pattern_str: &str) -> Result<NoteDetail
     // Parse individual slide segment(s)
     // Format: <shape><target>[duration] or <shape><target>-<target>[duration] (chained targets)
     //     or: <shape><target><shape><target>[duration] (like p4>6 - two shapes in sequence)
+    //     or: V<mid><end>[duration] (Grand V-shape with mid button)
     
     // First, extract the duration (always at the end before optional modifiers)
     let duration_re = Regex::new(r"\[(\d+):(\d+)\]").unwrap();
@@ -251,6 +258,31 @@ fn parse_slide_pattern(start_btn: usize, pattern_str: &str) -> Result<NoteDetail
         // For now, we'll parse it as if the start button is correct
         let after_star = &pattern_clean[1..];
         return parse_slide_pattern(start_btn, &format!("{}{}", after_star, duration_re.find(pattern_str).unwrap().as_str()));
+    }
+    
+    // Check for Grand V-shape (V<mid><end>) first - this needs special handling
+    let grand_v_re = Regex::new(r"^V(\d)(\d)$").unwrap();
+    if let Some(caps) = grand_v_re.captures(pattern_clean) {
+        let mid_btn = caps[1].parse::<usize>().unwrap();
+        let end_btn = caps[2].parse::<usize>().unwrap();
+        return Ok(NoteDetail::Slide(
+            start_btn,
+            SlideShape::GrandVShape(start_btn, end_btn, mid_btn),
+            duration,
+        ));
+    }
+    
+    // Check for dash-chained straight slides (like -4-7 meaning 8->4->7)
+    // Use GrandVShape to store the waypoint (mid parameter)
+    let dash_chain_re = Regex::new(r"^-(\d+)-(\d+)$").unwrap();
+    if let Some(caps) = dash_chain_re.captures(pattern_clean) {
+        let waypoint = caps[1].parse::<usize>().unwrap();
+        let end_btn = caps[2].parse::<usize>().unwrap();
+        return Ok(NoteDetail::Slide(
+            start_btn,
+            SlideShape::GrandVShape(start_btn, end_btn, waypoint),
+            duration,
+        ));
     }
     
     // Try to match multiple shape segments (like p4>6)
@@ -278,18 +310,20 @@ fn parse_slide_pattern(start_btn: usize, pattern_str: &str) -> Result<NoteDetail
     let shape = match shape_indicator {
         "-" => SlideShape::Straight(start_btn, end_btn),
         "^" => SlideShape::ShortArc(start_btn, end_btn),
-        "v" | "V" => SlideShape::VShape(start_btn, end_btn),
+        "v" => SlideShape::VShape(start_btn, end_btn),
+        "V" => SlideShape::VShape(start_btn, end_btn), // Single-segment V is regular V-shape
         "<" => SlideShape::CounterClockwiseArc(start_btn, end_btn),
         ">" => SlideShape::ClockwiseArc(start_btn, end_btn),
         "p" => SlideShape::PShape(start_btn, end_btn),
         "q" => SlideShape::QShape(start_btn, end_btn),
         "pp" => SlideShape::GrandPShape(start_btn, end_btn),
         "qq" => SlideShape::GrandQShape(start_btn, end_btn),
-        "s" | "z" => SlideShape::Thunderbolt(start_btn, end_btn),
+        "s" => SlideShape::Thunderbolt(start_btn, end_btn, false),
+        "z" => SlideShape::Thunderbolt(start_btn, end_btn, true),
         "w" => {
             // Fan shape - requires multiple targets
             // For now treating as straight, needs special parsing
-            SlideShape::Straight(start_btn, end_btn)
+            SlideShape::FanShape(start_btn, (end_btn, (end_btn + 1) % 8, (end_btn - 1) % 8))
         }
         "*" => {
             // Star notation for chained slides
@@ -300,4 +334,45 @@ fn parse_slide_pattern(start_btn: usize, pattern_str: &str) -> Result<NoteDetail
     };
     
     Ok(NoteDetail::Slide(start_btn, shape, duration))
+}
+
+/// Parse star-chained slides like "1-4[8:1]*-6[8:1]" into multiple sequential notes
+fn parse_star_chained_slides(start_btn: usize, pattern_str: &str, is_break: bool, is_firework: bool) -> Result<Vec<Note>, String> {
+    // Split by star to get individual slide segments
+    let segments: Vec<&str> = pattern_str.split('*').collect();
+    let mut notes = Vec::new();
+    let mut current_start = start_btn;
+    
+    for segment in segments {
+        let note_detail = parse_slide_pattern(current_start, segment)?;
+        
+        // Extract end button from the slide shape to use as next start
+        current_start = match note_detail {
+            NoteDetail::Slide(_, shape, _) => {
+                match shape {
+                    SlideShape::Straight(_, end) => end,
+                    SlideShape::ShortArc(_, end) => end,
+                    SlideShape::ClockwiseArc(_, end) => end,
+                    SlideShape::CounterClockwiseArc(_, end) => end,
+                    SlideShape::VShape(_, end) => end,
+                    SlideShape::PShape(_, end) => end,
+                    SlideShape::QShape(_, end) => end,
+                    SlideShape::GrandVShape(_, end, _) => end,
+                    SlideShape::GrandPShape(_, end) => end,
+                    SlideShape::GrandQShape(_, end) => end,
+                    SlideShape::Thunderbolt(_, end, _) => end,
+                    SlideShape::FanShape(_, (end1, _, _)) => end1,
+                }
+            }
+            _ => return Err("Star-chained segment is not a slide".to_string()),
+        };
+        
+        notes.push(Note {
+            is_break,
+            is_firework,
+            note_type: note_detail,
+        });
+    }
+    
+    Ok(notes)
 }

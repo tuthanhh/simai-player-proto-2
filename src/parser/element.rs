@@ -35,6 +35,6 @@ pub enum SlideShape {
     GrandVShape(usize, usize, usize),       // start, end, mid
     GrandPShape(usize, usize),              // start, end
     GrandQShape(usize, usize),              // start, end
-    Thunderbolt(usize, usize),              // start, end
+    Thunderbolt(usize, usize, bool),        // start, end, is_z
     FanShape(usize, (usize, usize, usize)), // start, (end 1, end 2, end 3)
 }

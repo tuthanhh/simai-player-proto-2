@@ -3,7 +3,7 @@ use bevy::mesh::{Indices, Mesh, PrimitiveTopology};
 use bevy::prelude::Vec2;
 use bevy::prelude::*;
 use rand::Rng;
-use std::f32::consts::{PI, FRAC_PI_2};
+use std::f32::consts::{FRAC_PI_2, PI};
 
 use crate::parser::element::SlideShape;
 
@@ -180,13 +180,14 @@ pub fn get_transform_at_distance(points: &[Vec2], target_distance: f32) -> (Vec2
     (*last, angle)
 }
 
-pub fn generate_points(shape: &SlideShape, boundary_radius: f32) -> Vec<Vec2> {
+use std::f32::consts::TAU;
+// Assuming bevy::prelude::Vec2 or similar is in scope
+
+pub fn generate_points(shape: &SlideShape, boundary_radius: f32, inner_radius: f32) -> Vec<Vec2> {
     let spacing = 35.0; // Desired spacing between generated points
 
     // Helper closure to calculate the angle from a button index (assumes 1-8 indexing)
-    let button_angle = |button: usize| -> f32 {
-        FRAC_PI_2 - (-0.5 + button as f32) * (PI / 4.0)
-    };
+    let button_angle = |button: usize| -> f32 { FRAC_PI_2 - (-0.5 + button as f32) * (PI / 4.0) };
 
     // Helper closure to calculate the XY position from a button index
     let button_pos = |button: usize| -> Vec2 {
@@ -194,30 +195,34 @@ pub fn generate_points(shape: &SlideShape, boundary_radius: f32) -> Vec<Vec2> {
         Vec2::new(boundary_radius * a.cos(), boundary_radius * a.sin())
     };
 
+    // Helper to safely stitch path segments without duplicating the exact connecting vertex
+    let append_path = |base: &mut Vec<Vec2>, mut next_segment: Vec<Vec2>| {
+        if let (Some(last), Some(first)) = (base.last(), next_segment.first()) {
+            if last.distance(*first) < 1.0 {
+                // threshold to catch floating point drift
+                next_segment.remove(0);
+            }
+        }
+        base.extend(next_segment);
+    };
     match shape {
         SlideShape::Straight(start, end) => {
-            let start_pos = button_pos(*start);
-            let end_pos = button_pos(*end);
-
-            let distance = start_pos.distance(end_pos);
-            let steps = (distance / spacing).ceil().max(1.0) as usize;
-            let mut points = Vec::with_capacity(steps + 1);
-
-            for i in 0..=steps {
-                let t = i as f32 / steps as f32;
-                points.push(start_pos.lerp(end_pos, t));
-            }
-            points
+            // Reused the multi-segment helper to DRY this up
+            generate_multi_segment_points(&[button_pos(*start), button_pos(*end)], spacing)
         }
 
         SlideShape::ShortArc(start, end) => {
             let start_ang = button_angle(*start);
             let mut end_ang = button_angle(*end);
 
-            // Calculate the shortest path (-PI to PI)
-            let mut diff = (end_ang - start_ang) % (2.0 * PI);
-            if diff > PI { diff -= 2.0 * PI; }
-            if diff < -PI { diff += 2.0 * PI; }
+            // Calculate the shortest path (-PI to PI) using TAU (2 PI)
+            let mut diff = (end_ang - start_ang) % TAU;
+            if diff > PI {
+                diff -= TAU;
+            }
+            if diff < -PI {
+                diff += TAU;
+            }
             end_ang = start_ang + diff;
 
             generate_arc_points(start_ang, end_ang, boundary_radius, spacing)
@@ -228,8 +233,8 @@ pub fn generate_points(shape: &SlideShape, boundary_radius: f32) -> Vec<Vec2> {
             let mut end_ang = button_angle(*end);
 
             // Clockwise means angle decreases
-            while end_ang > start_ang { 
-                end_ang -= 2.0 * PI; 
+            while end_ang > start_ang {
+                end_ang -= TAU;
             }
 
             generate_arc_points(start_ang, end_ang, boundary_radius, spacing)
@@ -240,39 +245,153 @@ pub fn generate_points(shape: &SlideShape, boundary_radius: f32) -> Vec<Vec2> {
             let mut end_ang = button_angle(*end);
 
             // Counter-clockwise means angle increases
-            while end_ang < start_ang { 
-                end_ang += 2.0 * PI; 
+            while end_ang < start_ang {
+                end_ang += TAU;
             }
 
             generate_arc_points(start_ang, end_ang, boundary_radius, spacing)
         }
 
-        SlideShape::VShape(start, end) => {
-            let start_pos = button_pos(*start);
-            let center_pos = Vec2::ZERO;
-            let end_pos = button_pos(*end);
+        SlideShape::VShape(start, end) => generate_multi_segment_points(
+            &[button_pos(*start), Vec2::ZERO, button_pos(*end)],
+            spacing,
+        ),
 
-            generate_multi_segment_points(&[start_pos, center_pos, end_pos], spacing)
+        SlideShape::GrandVShape(start, end, mid) => generate_multi_segment_points(
+            &[button_pos(*start), button_pos(*mid), button_pos(*end)],
+            spacing,
+        ),
+
+        // --- STANDARD INNER LOOPS (p / q) ---
+        SlideShape::PShape(start, end) | SlideShape::QShape(start, end) => {
+            let is_q = matches!(shape, SlideShape::QShape(_, _));
+
+            // 1. Define the offset circle
+            let r_loop = inner_radius; // Roughly 1/4 of the screen
+            let start_ang = button_angle(*start);
+            let end_ang = button_angle(*end);
+
+            // Center of the loop is offset by 90 degrees left (q) or right (p)
+            let loop_ang = if is_q {
+                start_ang + FRAC_PI_2
+            } else {
+                start_ang - FRAC_PI_2
+            };
+            let c_loop = Vec2::new(r_loop * loop_ang.cos(), r_loop * loop_ang.sin());
+
+            // 2. Find tangent points from Start button to the offset circle
+            let start_pos_vec = button_pos(*start);
+            let s_to_c = start_pos_vec - c_loop;
+            let gamma = (-s_to_c).to_angle(); // Angle from circle center to start pos
+            let alpha = (r_loop / s_to_c.length()).clamp(-1.0, 1.0).acos();
+
+            // We pick the tangent that forces the path to wrap around the *outside* of the loop
+            let t_ang = if is_q { gamma - alpha } else { gamma + alpha };
+            let p_tangent = c_loop + Vec2::new(r_loop * t_ang.cos(), r_loop * t_ang.sin());
+
+            // 3. Arc from tangent to the origin (0, 0)
+            let origin_ang = loop_ang + PI; // Angle of (0,0) relative to the loop center
+            let mut target_ang = origin_ang;
+
+            if is_q {
+                // Counter-Clockwise
+                while target_ang < t_ang {
+                    target_ang += TAU;
+                }
+            } else {
+                // Clockwise
+                while target_ang > t_ang {
+                    target_ang -= TAU;
+                }
+            }
+
+            // Generate segments
+            let mut path = generate_multi_segment_points(&[start_pos_vec, p_tangent], spacing);
+
+            // Note: We need a slight modification to generate_arc_points to accept a center offset
+            let arc_points = generate_offset_arc_points(c_loop, t_ang, target_ang, r_loop, spacing);
+            append_path(&mut path, arc_points);
+
+            append_path(
+                &mut path,
+                generate_multi_segment_points(&[Vec2::ZERO, button_pos(*end)], spacing),
+            );
+
+            path
         }
 
-        SlideShape::GrandVShape(start, end, mid) => {
+        // --- GRAND OUTER LOOPS (pp / qq) ---
+        SlideShape::GrandPShape(start, end) | SlideShape::GrandQShape(start, end) => {
+            let is_q = matches!(shape, SlideShape::GrandQShape(_, _));
+
+            let r_grand = boundary_radius * 0.5; // Radius of the 'B' ring
+            let start_ang = button_angle(*start);
+            let end_ang = button_angle(*end);
+
+            // 1. Go straight inwards from start button to the B ring
+            let p_in = Vec2::new(r_grand * start_ang.cos(), r_grand * start_ang.sin());
+            let p_out = Vec2::new(r_grand * end_ang.cos(), r_grand * end_ang.sin());
+
+            let mut path = generate_multi_segment_points(&[button_pos(*start), p_in], spacing);
+
+            // 2. Calculate the natural sweep angle
+            let mut delta_theta = if is_q {
+                let mut diff = end_ang - start_ang;
+                while diff <= 0.0 {
+                    diff += TAU;
+                }
+                diff
+            } else {
+                let mut diff = start_ang - end_ang;
+                while diff <= 0.0 {
+                    diff += TAU;
+                }
+                diff
+            };
+
+            // 3. THE MAGIC RULE: If destination is less than 180 deg away, add a full 360 loop!
+            // (Matches panels 2, 3, 8, and 1 in the OUTER LOOP image)
+            if delta_theta < PI {
+                delta_theta += TAU;
+            }
+
+            // 4. Generate the massive arc centered at (0,0)
+            let target_ang = if is_q {
+                start_ang + delta_theta
+            } else {
+                start_ang - delta_theta
+            };
+            append_path(
+                &mut path,
+                generate_arc_points(start_ang, target_ang, r_grand, spacing),
+            );
+
+            // 5. Go straight outwards from B ring to the end button
+            append_path(
+                &mut path,
+                generate_multi_segment_points(&[p_out, button_pos(*end)], spacing),
+            );
+
+            path
+        }
+        SlideShape::Thunderbolt(start, end, is_z) => {
             let start_pos = button_pos(*start);
-            let mid_pos = button_pos(*mid);
             let end_pos = button_pos(*end);
 
-            // Note: Passed in order of Start -> Mid -> End
-            generate_multi_segment_points(&[start_pos, mid_pos, end_pos], spacing)
-        }
+            let mut mid1_pos = button_pos(9 - *start);
+            let mut mid2_pos = button_pos(9 - *end);
 
-        SlideShape::PShape(_start, _end) => unimplemented!("PShape (p) requires Bezier curve implementation"),
-        SlideShape::QShape(_start, _end) => unimplemented!("QShape (q) requires Bezier curve implementation"),
-        SlideShape::GrandPShape(_start, _end) => unimplemented!("GrandPShape (pp) requires Bezier curve implementation"),
-        SlideShape::GrandQShape(_start, _end) => unimplemented!("GrandQShape (qq) requires Bezier curve implementation"),
-        SlideShape::Thunderbolt(_start, _end) => unimplemented!("Thunderbolt (s/z) requires zig-zag offset logic"),
-        
-        // Note: Fan shapes spawn 3 stars! You might need to change your engine architecture 
+            mid1_pos = mid1_pos.normalize() * boundary_radius* 0.4;
+            mid2_pos = mid2_pos.normalize() * boundary_radius* 0.4;
+
+            // Reuse your handy multi-segment generator!
+            generate_multi_segment_points(&[start_pos, mid1_pos, mid2_pos, end_pos], spacing)
+        }
+        // Note: Fan shapes spawn 3 stars! You might need to change your engine architecture
         // to return `Vec<Vec<Vec2>>` so you can handle all 3 paths at once.
-        SlideShape::FanShape(_start, (_end1, _end2, _end3)) => unimplemented!("FanShape (w) requires splitting into 3 paths"),
+        SlideShape::FanShape(_start, (_end1, _end2, _end3)) => {
+            unimplemented!("FanShape (w) requires splitting into 3 paths")
+        }
     }
 }
 
@@ -295,16 +414,33 @@ fn generate_arc_points(start_angle: f32, end_angle: f32, radius: f32, spacing: f
     points
 }
 
+fn generate_offset_arc_points(center: Vec2, start_angle: f32, end_angle: f32, radius: f32, spacing: f32) -> Vec<Vec2> {
+    let angle_diff = (end_angle - start_angle).abs();
+    let arc_length = radius * angle_diff;
+    let steps = (arc_length / spacing).ceil().max(1.0) as usize;
+    let mut points = Vec::with_capacity(steps + 1);
+
+    for i in 0..=steps {
+        let t = i as f32 / steps as f32;
+        let current_angle = start_angle + (end_angle - start_angle) * t;
+        points.push(center + Vec2::new(
+            radius * current_angle.cos(),
+            radius * current_angle.sin(),
+        ));
+    }
+    points
+}
+
 fn generate_multi_segment_points(waypoints: &[Vec2], spacing: f32) -> Vec<Vec2> {
     let mut points = Vec::new();
-    
+
     for w in 0..(waypoints.len() - 1) {
         let p1 = waypoints[w];
         let p2 = waypoints[w + 1];
         let distance = p1.distance(p2);
         let steps = (distance / spacing).ceil().max(1.0) as usize;
-        
-        // To avoid duplicating the exact waypoint where segments connect, 
+
+        // To avoid duplicating the exact waypoint where segments connect,
         // skip the first point of the next segment if it's not the very first segment.
         let start_i = if w == 0 { 0 } else { 1 };
 
